@@ -1,0 +1,99 @@
+# =============================================================================
+# TurgovBot .gitignore
+# =============================================================================
+
+# --- Переменные окружения и секреты ---
+.env
+.env.*
+!.env.example
+
+# --- Google Cloud / Service Account ключи ---
+*.json
+!package.json
+!package-lock.json
+!data/criminal_case_templates/*.json
+!data/golden_advice_cases.json
+
+# Явно игнорируем файлы credentials
+credentials.json
+vertex-credentials*.json
+turgovbot*.json
+turgovbot2*.json
+client_secret_*.json
+token_gdocs.json
+majestic-rp-bot-*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Виртуальное окружение ---
+venv/
+.venv/
+env/
+
+# --- IDE ---
+.idea/
+.vscode/
+.playwright-mcp/
+*.swp
+*.swo
+*~
+
+# --- Логи ---
+logs/
+*.log
+
+# --- Временные файлы ---
+temp_files/
+*.tmp
+*.bak
+
+# --- Данные пользователей (JSON-хранилища) ---
+data/admins.json
+data/banned_users.json
+data/users.json
+data/user_usage.json
+data/vip_users.json
+data/server_status.json
+data/disabled_servers.json
+data/gemini_files_map_*.json
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- Caddy / TLS (Cloudflare Origin Certificate — приватный ключ НЕ коммитить!) ---
+caddy/certs/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# --- Тяжёлые артефакты хоста (модели, обновления клиента, выгрузки обогащения) ---
+models/
+updates/
+data/law-enrichment/
+data/kimi-enrichment/
+.tmp/
+*.dump
+
+# --- Бэкапы ---
+backups/
+
+# --- Credentials директория ---
+credentials/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+.deploytmp/
+.claude/
+/Website design for bot.zip

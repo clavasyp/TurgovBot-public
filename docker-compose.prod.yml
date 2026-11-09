@@ -1,0 +1,51 @@
+# =============================================================================
+# docker-compose.prod.yml — Production overrides
+# =============================================================================
+# Использование: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# В production используются готовые образы из registry вместо локальной сборки
+# =============================================================================
+
+services:
+  bot:
+    build: !reset null
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-clavasyp}/turgovbot:latest
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    build: !reset null
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-clavasyp}/turgovbot:latest
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  law-embedding-worker:
+    build: !reset null
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-clavasyp}/turgovbot:latest
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  parser-worker:
+    build: !reset null
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-clavasyp}/turgovbot-parser:latest
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    build: !reset null
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-clavasyp}/turgovbot:latest

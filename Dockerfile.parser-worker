@@ -1,0 +1,44 @@
+# =============================================================================
+# Dockerfile для Parser Worker (Playwright + FastAPI)
+# =============================================================================
+FROM python:3.11-slim
+
+# Системные зависимости для Playwright и прочего
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libgtk-3-0 \
+    libasound2 \
+    libxshmfence1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем и устанавливаем зависимости
+COPY parser_worker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Устанавливаем браузеры Playwright
+RUN playwright install firefox && playwright install-deps firefox
+
+# Копируем воркер
+COPY parser_worker/worker.py .
+
+# Не-root пользователь
+RUN useradd --create-home appuser \
+    && chown -R appuser:appuser /app \
+    && mkdir -p /home/appuser/.cache && cp -r /root/.cache/ms-playwright /home/appuser/.cache/ \
+    && chown -R appuser:appuser /home/appuser/.cache
+USER appuser
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8765/health || exit 1
+
+CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8765"]

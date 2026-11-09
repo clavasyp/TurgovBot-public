@@ -1,0 +1,24 @@
+# .dockerignore
+.git
+.gitignore
+.env*
+!.env.example
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+logs/
+temp_files/
+*.md
+.claude/
+.env.backup
+Dockerfile*
+docker-compose*.yml
+backups/
+# шелл-скрипты бэкапа/миграции в образ не нужны; python-харнессы (scripts/golden_advice.py) — нужны
+scripts/*.sh
+
+# Незаконченный эксперимент v3 — в образ не входит
+experimental/

@@ -1,0 +1,90 @@
+overlay.turgovbot.ru {
+	# --- TLS: Cloudflare Origin Certificate (НЕ Let's Encrypt) ---
+	# Явная директива `tls <cert> <key>` ПОЛНОСТЬЮ отключает авто-ACME для хоста:
+	# Caddy грузит указанные файлы и в Let's Encrypt не обращается.
+	# Файлы монтируются из ./caddy/certs (см. docker-compose).
+	tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin-key.pem
+
+	# Лог доступа в stdout — удобно дебажить: docker compose logs -f caddy
+	log {
+		output stdout
+		format console
+	}
+
+	# --- Анти-спуф CF-Connecting-IP ---
+	# Бэкенд доверяет этому заголовку как реальному IP юзера (rate-limit, IP-whitelist,
+	# детект мульти-IP лицензий). Cloudflare ставит его сам ТОЛЬКО на своём эдже; если же кто-то
+	# подключится к origin НАПРЯМУЮ (в обход оранжевого облака), он может прислать любой IP.
+	# Поэтому от пиров НЕ из официальных диапазонов Cloudflare (cloudflare.com/ips) заголовок
+	# срезаем — get_client_ip тогда возьмёт адрес соединения из X-Forwarded-For.
+	@not_cf not remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	request_header @not_cf -CF-Connecting-IP
+
+	# --- Статика авто-обновлений десктоп-клиента (overlay) ---
+	# Раздаёт manifest.json + установщики из /srv/updates (том ./updates).
+	# handle_path срезает префикс /updates → /updates/manifest.json = /srv/updates/manifest.json.
+	# manifest.json — no-cache (чтобы Cloudflare/клиент не залипали на старой версии);
+	# установщики имеют версионное имя → кешируются спокойно.
+	# Идёт ДО catch-all `handle` — handle/handle_path взаимоисключающи и проверяются по порядку.
+	handle_path /updates/* {
+		root * /srv/updates
+		# manifest.json (legacy) + manifest-v2.json (бесшовный апдейтер) — no-cache.
+		@manifest path /manifest.json /manifest-v2.json
+		header @manifest Cache-Control "no-cache, no-store, must-revalidate"
+		# Версионированные файлы делты /v2/<ver>/* — immutable (кэшируются на CDN навсегда).
+		@versioned path /v2/*
+		header @versioned Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# --- Реверс-прокси на FastAPI/uvicorn внутри сети botnet (всё, кроме /updates/*) ---
+	handle {
+		reverse_proxy api:8000 {
+			# SSE (/v1/overlay/advise/stream) и любой стрим — без буферизации,
+			# каждый чанк сразу клиенту.
+			flush_interval -1
+
+			# WebSocket (/v1/voice/stream): Upgrade/Connection Caddy v2 проксирует САМ.
+			# X-Forwarded-For/Proto и Host Caddy шлёт ПО УМОЛЧАНИЮ — явные header_up
+			# не нужны (иначе warning при старте).
+			# (опц.) реальный IP клиента из Cloudflare, если понадобится логировать/банить:
+			# header_up X-Real-IP {http.request.header.CF-Connecting-IP}
+		}
+	}
+}
+
+# За оранжевым облаком Cloudflare сам делает Always Use HTTPS на edge,
+# поэтому отдельный :80-редирект не обязателен и порт 80 публиковать не нужно.
+
+# =============================================================================
+# САЙТ TurgovBot (site.turgovbot.ru)
+# =============================================================================
+# Изолированный стек сайта (/opt/turgovbot-site): контейнеры site-web (Next.js)
+# и site-api (FastAPI, /v1/web/*) на общей сети botnet. Раньше этот блок жил
+# ТОЛЬКО на диске сервера и ЗАТИРАЛСЯ каждым деплоем (scp Caddyfile) — теперь
+# он в репо, чтобы пережить и деплой, и рестарт caddy.
+# TLS: Cloudflare Origin wildcard-серт (SAN *.turgovbot.ru), файлы на сервере
+# /opt/TurgovBot/caddy/certs/site-origin{.pem,-key.pem} (как origin.pem выше).
+site.turgovbot.ru {
+	tls /etc/caddy/certs/site-origin.pem /etc/caddy/certs/site-origin-key.pem
+
+	log {
+		output stdout
+		format console
+	}
+
+	encode zstd gzip
+
+	# /v1/* → бэкенд сайта (FastAPI/uvicorn). flush_interval -1 — стриминг Q&A
+	# (SSE) отдаётся чанками сразу, без буферизации.
+	handle /v1/* {
+		reverse_proxy site-api:8000 {
+			flush_interval -1
+		}
+	}
+
+	# Всё остальное → фронт (Next.js).
+	handle {
+		reverse_proxy site-web:3000
+	}
+}

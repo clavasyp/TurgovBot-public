@@ -1,0 +1,246 @@
+# =============================================================================
+# docker-compose.yml — TurgovBot Infrastructure
+# =============================================================================
+# Запуск:       docker compose up -d
+# Остановка:    docker compose down
+# Логи:         docker compose logs -f bot
+# Бэкап БД:     docker compose exec db pg_dump -U bot_db_user bot_database > backup.sql
+# Миграции:     docker compose exec bot python -m alembic upgrade head
+# =============================================================================
+
+services:
+  # ─── PostgreSQL Database ──────────────────────────────────────────────────
+  db:
+    # pgvector/pgvector:pg16 = тот же PostgreSQL 16 + предустановленное расширение
+    # pgvector (нужно для семантического ретривала: таблица law_chunks, тип vector).
+    # Drop-in замена postgres:16 (тот же major-релиз → том данных совместим).
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"  # Только для локального доступа (бэкап, отладка)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - botnet
+
+  # ─── Telegram Bot (основной процесс) ─────────────────────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python main.py
+    healthcheck:
+      disable: true
+    env_file: .env
+    environment:
+      - DB_HOST=db  # Переопределяем хост для контейнерной сети
+      # Конкурентность вызовов Vertex на модель в процессе БОТА. Раньше переменной здесь не
+      # было → дефолт 1: один тяжёлый ход ролевого помощника (дело до 432к символов) занимал
+      # единственный слот gemini-3-flash, и все остальные пользователи (вопросы, жалобы)
+      # ждали в очереди за семафором. У api это уже исправлено тем же способом.
+      - VERTEX_MODEL_CONCURRENCY=${VERTEX_MODEL_CONCURRENCY:-4}
+    volumes:
+      - ./data:/app/data                      # JSON-данные (сохранность)
+      - ./logs:/app/logs                      # Логи
+      - ./temp_files:/app/temp_files          # Временные файлы
+      - ./credentials:/app/credentials        # Google credentials (rw: горячая смена сервис-аккаунта из админки)
+      - ./updates:/app/updates:ro             # Раздача апдейтов оверлея (manifest+exe) — /test отдаёт .exe файлом из локального тома
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - botnet
+
+  # ─── FastAPI REST API ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Переходный deploy должен дать старому встроенному consumer завершить batch.
+    # После выноса consumer сюда всё равно полезно оставить мягкое завершение API.
+    stop_grace_period: 2m
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      - DB_HOST=db
+      - LAW_EMBED_RUN_WORKER=false
+      - LAW_CATALOG_EMBED_INTRA_THREADS=2
+      - LAW_SEARCH_EMBED_TIMEOUT=${LAW_SEARCH_EMBED_TIMEOUT:-2.0}
+      # Конкурентность вызовов Vertex на модель в ЭТОМ процессе (оверлей qa/advise).
+      # Раньше лимитер сериализовал в 1 поток → под конкуренцией очередь и таймаут.
+      # Только для API; у бота переменной нет → дефолт 1 (прежнее поведение, не трогаем).
+      - VERTEX_MODEL_CONCURRENCY=4
+    ports:
+      - "${API_SERVER_PORT:-8000}:8000"
+    volumes:
+      - ./credentials:/app/credentials        # rw: горячая смена сервис-аккаунта (тот же том, что у bot)
+      - ./logs:/app/logs
+      - ./models:/app/models:ro               # локальная модель эмбеддингов поиска (FRIDA) — большой статик-ассет вне образа (том, переживает ре-деплой)
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # API синхронно грузит тот же pinned FRIDA для query-векторов. Его cold
+      # start имеет тот же 120s budget, что и dedicated worker.
+      start_period: 150s
+    networks:
+      - botnet
+
+  # ─── Dedicated FRIDA embedding worker ───────────────────────────────────
+  # API держит модель для query-векторов, а этот процесс независимо дренирует
+  # durable DB-очередь. Поэтому HTTP redeploy больше не обрывает текущий backfill.
+  law-embedding-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 3m
+    command: python /app/scripts/run_law_embedding_worker.py
+    env_file: .env
+    environment:
+      - DB_HOST=db
+      - LAW_EMBED_RUN_WORKER=true
+      # Согласовано с health start_period=150s и deploy wait=300s. Не наследуем
+      # случайное старое значение из .env, иначе корректный CI timeout расходится
+      # с разрешённым временем загрузки/зависания процесса.
+      - LAW_EMBED_WORKER_INIT_TIMEOUT_SECONDS=120
+      - LAW_EMBED_JOB_CHUNK_TIMEOUT_SECONDS=120
+      # На production-хосте 8 CPU: шесть worker-у, два остаются API/БД/боту.
+      - LAW_CATALOG_EMBED_INTRA_THREADS=${LAW_EMBED_WORKER_INTRA_THREADS:-6}
+      # Production benchmark: chunk 4 и 8 имеют одинаковый throughput, но 4
+      # вдвое уменьшает неделимый CPU-квант и надёжнее укладывается в shutdown.
+      - LAW_EMBED_JOB_INFERENCE_CHUNK_SIZE=${LAW_EMBED_WORKER_INFERENCE_CHUNK_SIZE:-4}
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/run_law_embedding_worker.py", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      # Пока модель/паспорт не готовы, heartbeat имеет state=starting и не
+      # считается healthy. Даём загрузке pinned 3.3GB артефакта отдельное окно.
+      start_period: 150s
+    networks:
+      - botnet
+
+  # ─── Caddy (TLS-терминатор за Cloudflare, Origin Certificate) ────────────
+  # Подаёт wss/https на overlay.turgovbot.ru → reverse_proxy на api:8000.
+  # TLS — Cloudflare Origin Certificate (Full strict), НЕ Let's Encrypt.
+  # ПЕРЕД запуском положить cert/key: ./caddy/certs/origin.pem + origin-key.pem
+  # (создаются в Cloudflare → SSL/TLS → Origin Server; ключ хранить chmod 600).
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "443:443"          # единственный обязательный порт (CF проксирует HTTPS на 443)
+      # - "80:80"          # ОПЦ.: локальный http->https редирект. За CF не нужен.
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/certs:/etc/caddy/certs:ro
+      # Статика авто-обновлений overlay-клиента (manifest.json + установщики).
+      # Раздаётся Caddy на /updates/* (см. Caddyfile). Релиз клиента = заливка файлов
+      # сюда, БЕЗ передеплоя bot/api → очередь анализатора не трогается.
+      - ./updates:/srv/updates:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    networks:
+      - botnet
+
+  # ─── FlareSolverr (обход Cloudflare для gta5rp-форума) ───────────────────
+  # forum.gta5rp.com закрыли за Cloudflare ("Just a moment…", 403) → headless Playwright
+  # палится, cf_clearance не выдаётся. FlareSolverr держит undetected-браузер, решает
+  # JS-челлендж и отдаёт готовый HTML + cf_clearance. Обращается только parser-worker по
+  # внутренней сети botnet (наружу порт не публикуем). majestic-путь этот сервис не трогает.
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Europe/Moscow
+      # Держим один тёплый браузер: сессия gta5rp переиспользует cf_clearance между запросами.
+      - BROWSER_TIMEOUT=60000
+    # Healthcheck отключаем намеренно: `docker compose up --wait` в деплое не должен гейтиться
+    # на холодный старт Chrome / первый solve. parser-worker обращается best-effort с фолбэком.
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - botnet
+
+  # ─── Parser Worker (Playwright) ──────────────────────────────────────────
+  parser-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.parser-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # CF-защищённые хосты (gta5rp) тянем через FlareSolverr по внутренней сети.
+      # Без этой переменной CF-путь инертен → поведение прежнее (majestic не затрагивается).
+      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
+      - CF_PROTECTED_HOSTS=forum.gta5rp.com
+    ports:
+      - "127.0.0.1:8765:8765"  # Только для локального доступа
+    depends_on:
+      - flaresolverr
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - botnet
+
+  # ─── Alembic Migrations (one-shot) ──────────────────────────────────────
+  # Запуск: docker compose run --rm migrate
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m alembic upgrade head
+    env_file: .env
+    environment:
+      - DB_HOST=db
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - tools  # Не запускается с `docker compose up`, только через `docker compose run --rm migrate`
+    networks:
+      - botnet
+
+volumes:
+  pgdata:
+    name: turgovbot_pgdata  # Именованный volume для сохранности данных БД
+  caddy_data:   # состояние Caddy (сертификаты/ACME-кеш — нам нужен лишь для совместимости)
+  caddy_config: # автоконфиг Caddy
+
+networks:
+  botnet:
+    driver: bridge
